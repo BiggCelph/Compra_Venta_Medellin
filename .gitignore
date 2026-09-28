@@ -1,0 +1,20 @@
+# ── Raw scraped data: do not redistribute (regenerate with train.py, or keep local)
+arriendo_medellin.csv
+venta_medellin.csv
+
+# ── Experiment tracking / local noise
+mlruns/
+mlflow.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+
+# ── Deliberately committed (the deployed app needs them):
+#    artifacts/                 model pickles
+#    arr_mede_final.csv, ven_mede_final.csv   processed listings + predictions
+#    medellin.geojson           barrio polygons for the price map
+#    Tip: if you want less scraped data public, drop the `url` column or
+#    ship a sample of the processed CSVs instead.

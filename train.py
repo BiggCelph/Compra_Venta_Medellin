@@ -1,10 +1,15 @@
 """
-Medellín Real Estate — Training Pipeline  v2
+Medellín Real Estate — Training Pipeline  v3 (leak-free)
 ============================================
 Scrapes metrocuadrado.com + Fincaraíz, cleans data, engineers features
 (including estrato, metro distance, amenities), trains a stacked ensemble
 (XGBoost + LightGBM → Ridge meta-learner), produces quantile
 predictions for confidence intervals, and logs everything to MLflow.
+
+Data source: public listings scraped from metrocuadrado.com's internal search
+endpoint (unofficial; educational / portfolio use). Raw scraped CSVs are not
+meant to be redistributed: keep them out of version control (see .gitignore).
+Use --skip-scrape to train from your local copies.
 
 Usage:
     python train.py                          # scrape + train both
@@ -23,6 +28,7 @@ Outputs  →  ./artifacts/
     metro_stations.pkl
     list_barrios.pkl
     model_r2.pkl
+    model_metrics.pkl     (r2 / mae / median APE on the held-out test set)
     arr_mede_final.csv   / ven_mede_final.csv
 """
 
@@ -154,12 +160,20 @@ MLFLOW_EXPERIMENT = "medellin_re"
 # 1. SCRAPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Metrocuadrado has no official public API. This is the internal endpoint the
+# website's own frontend calls, with the same key its frontend sends to every
+# visitor. It is NOT a personal credential, but it is unofficial: it (or the
+# endpoint) can change without notice. Be polite: keep the delay between
+# requests, and check the site's terms of use / robots.txt before scraping.
+MC_PUBLIC_KEY = "P1MfFHfQMOtL16Zpg36NcntJYCLFm8FqFfudnavl"
+
+
 def _mc_headers() -> dict:
     return {
         "accept": "*/*",
         "content-type": "application/json",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "x-api-key": "P1MfFHfQMOtL16Zpg36NcntJYCLFm8FqFfudnavl",
+        "x-api-key": MC_PUBLIC_KEY,
     }
 
 
@@ -587,16 +601,22 @@ def add_metro_distance(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def price_aggregates(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Per-barrio price per m², per space and per parking, from the rows given."""
     pt = df.groupby("nombre")["precio"].sum().astype(float)
     at = df.groupby("nombre")["area"].sum().replace(0, np.nan).astype(float)
-    esp = df.groupby("nombre")["espacios"].sum().astype(float)
+    esp = df.groupby("nombre")["espacios"].sum().replace(
+        0, np.nan).astype(float)
     pq = (df.groupby("nombre")["parqueaderos"].sum() + 1).astype(float)
     return (pt / at).dropna(), (pt / esp).dropna(), (pt / pq).dropna()
 
 
-def engineer_features(df: pd.DataFrame,
-                      ppmc: pd.Series, pppz: pd.Series, pppp: pd.Series) -> pd.DataFrame:
-    """All features except barrio_te — computed train-only in prep()."""
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Row-level features only. Nothing here is derived from prices, so it is
+    safe to run before the train/test split. Price-derived barrio features
+    (ppmc, pppz, pppp, ratios, new_index, barrio_te) live in
+    fit_barrio_stats() / apply_barrio_stats() and are built after the split.
+    """
     df = df.copy()
     df["espacios"] = df["habitaciones"] + df["parqueaderos"] + df["baños"]
     df["axe"] = np.where(df["espacios"] == 0, df["area"],
@@ -606,10 +626,34 @@ def engineer_features(df: pd.DataFrame,
     df["axa"] = df["area"] ** 2
     df["parq2"] = df["parqueaderos"] ** 2
     df["garaje_bin"] = (df["parqueaderos"] > 0).astype(int)
-    df["ppmc"] = df["nombre"].map(ppmc)
-    df["pppz"] = df["nombre"].map(pppz)
-    df["pppp"] = df["nombre"].map(pppp)
-    df["new_index"] = df["ppmc"] / ppmc.max() * 100
+    df["barrio_count"] = df["nombre"].map(
+        df.groupby("nombre")["precio"].count())
+    return df.reset_index(drop=True)
+
+
+def fit_barrio_stats(df_fit: pd.DataFrame, y_fit_log: pd.Series, k: int = 10) -> dict:
+    """
+    Learn every price-derived neighbourhood statistic from `df_fit` ONLY:
+    price per m² / space / parking, and the smoothed target encoding.
+    Also stores global fallbacks for barrios never seen in `df_fit`.
+    """
+    ppmc, pppz, pppp = price_aggregates(df_fit)
+    gmean = float(y_fit_log.mean())
+    st_ = y_fit_log.groupby(df_fit["nombre"]).agg(["mean", "count"])
+    smooth = st_["count"] / (st_["count"] + k)
+    te = smooth * st_["mean"] + (1 - smooth) * gmean
+    return dict(ppmc=ppmc, pppz=pppz, pppp=pppp, te=te, gmean=gmean,
+                fb=dict(ppmc=float(ppmc.median()), pppz=float(pppz.median()),
+                        pppp=float(pppp.median())))
+
+
+def apply_barrio_stats(df: pd.DataFrame, s: dict) -> pd.DataFrame:
+    """Attach the price-derived barrio features using stats learned elsewhere."""
+    df = df.copy()
+    df["ppmc"] = df["nombre"].map(s["ppmc"]).fillna(s["fb"]["ppmc"])
+    df["pppz"] = df["nombre"].map(s["pppz"]).fillna(s["fb"]["pppz"])
+    df["pppp"] = df["nombre"].map(s["pppp"]).fillna(s["fb"]["pppp"])
+    df["new_index"] = df["ppmc"] / s["ppmc"].max() * 100
 
     def sr(a, b):
         return (a / b).replace([np.inf, -np.inf], np.nan).fillna(1).astype(float)
@@ -617,12 +661,47 @@ def engineer_features(df: pd.DataFrame,
     df["pppp/pppz"] = sr(df["pppp"], df["pppz"])
     df["pppp/ppmc"] = sr(df["pppp"], df["ppmc"])
     df["pppz/ppmc"] = sr(df["pppz"], df["ppmc"])
-    df["barrio_count"] = df["nombre"].map(
-        df.groupby("nombre")["precio"].count())
-    df["barrio_te"] = np.nan
+    df["barrio_te"] = df["nombre"].map(s["te"]).fillna(s["gmean"])
+    return df
 
-    df = df.dropna(subset=["ppmc", "pppz", "pppp", "pppz/ppmc"])
-    return df.reset_index(drop=True)
+
+def prep(df: pd.DataFrame):
+    """
+    Leak-free preparation.
+      1. Split FIRST (80/20).
+      2. Neighbourhood price features are learned from TRAIN rows only.
+         - test rows  -> features from the full-train statistics
+         - train rows -> out-of-fold (5-fold): each row's features come from
+           the OTHER folds, so its own price never feeds its own features.
+         (Leave-one-out is avoided on purpose: it lets trees decode the
+          target from the tiny gap between a row's LOO mean and the group's.)
+    Returns the full-train stats too; those are what the app uses.
+    """
+    y_full = np.log1p(df["precio"])
+    idx_tr, idx_te = train_test_split(
+        df.index, test_size=0.2, random_state=1954)
+    df_tr, df_te = df.loc[idx_tr].copy(), df.loc[idx_te].copy()
+    y_tr, y_te = y_full.loc[idx_tr], y_full.loc[idx_te]
+
+    stats = fit_barrio_stats(df_tr, y_tr)
+    df_te = apply_barrio_stats(df_te, stats)
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=7)
+    parts = []
+    for fit_i, app_i in kf.split(df_tr):
+        s_fold = fit_barrio_stats(df_tr.iloc[fit_i], y_tr.iloc[fit_i])
+        parts.append(apply_barrio_stats(df_tr.iloc[app_i], s_fold))
+    df_tr = pd.concat(parts).loc[df_tr.index]          # restore original order
+
+    X_tr, X_te = df_tr[NUM_ATTRIBS +
+                       CAT_ATTRIBS], df_te[NUM_ATTRIBS + CAT_ATTRIBS]
+    pp = make_preprocessor()
+    X_tr_t = pd.DataFrame(pp.fit_transform(X_tr),
+                          columns=pp.get_feature_names_out())
+    X_te_t = pd.DataFrame(pp.transform(X_te),
+                          columns=pp.get_feature_names_out())
+    cols = select_features(X_tr_t, y_tr, max_features=22)
+    return pp, X_tr_t[cols], X_te_t[cols], y_tr, y_te, cols, stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -739,6 +818,7 @@ class StackedEnsemble:
         self.xgb_p, self.lgb_p = xgb_p, lgb_p
         self.base_: list = []
         self.meta_: Ridge | None = None
+        self.oof_pred_ = None
 
     def _factories(self):
         return [
@@ -769,6 +849,8 @@ class StackedEnsemble:
 
         self.meta_ = Ridge(alpha=1.0)
         self.meta_.fit(oof, y)
+        # Out-of-fold ensemble prediction for every training row (log space)
+        self.oof_pred_ = self.meta_.predict(oof)
         print(
             f"    Ensemble OOF R²: {r2_score(y, self.meta_.predict(oof)):.4f}")
         print(f"    Weights — XGB:{self.meta_.coef_[0]:.3f}  "
@@ -835,6 +917,26 @@ def evaluate(model, X_te, y_te, label: str) -> dict:
                              "med_APE%": np.median(np.abs(g.p-g.a)/g.a*100)})
     ).to_string())
     return {"r2": r2, "mae": mae, "mape": mape}
+
+
+def attach_predictions(df, stack, y_tr, y_te, X_te) -> pd.DataFrame:
+    """
+    Give EVERY listing a price prediction from a model that never saw it:
+      train rows -> out-of-fold prediction from the stacked ensemble
+      test rows  -> prediction from the final model (held out)
+    The app's "opportunities" are built from this, not from in-sample fits.
+    """
+    df = df.copy()
+    df["cat_pred"] = np.nan
+    df["split"] = ""
+    if stack is not None:
+        df.loc[y_tr.index, "cat_pred"] = np.expm1(stack.oof_pred_)
+        df.loc[y_te.index, "cat_pred"] = np.expm1(stack.predict(X_te))
+        df.loc[y_tr.index, "split"] = "train"
+        df.loc[y_te.index, "split"] = "test"
+    df["pct_underpriced"] = (
+        df["cat_pred"] - df["precio"]) / df["cat_pred"] * 100
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -905,18 +1007,9 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
         arr_clean = add_metro_distance(arr_clean)
         ven_clean = add_metro_distance(ven_clean)
 
-        for df in [arr_clean, ven_clean]:
-            df["espacios"] = df["habitaciones"] + \
-                df["parqueaderos"] + df["baños"]
-
-        ppmc_arr, pppz_arr, pppp_arr = price_aggregates(arr_clean)
-        ppmc_ven, pppz_ven, pppp_ven = price_aggregates(ven_clean)
-
-        arr = engineer_features(arr_clean, ppmc_arr, pppz_arr, pppp_arr)
-        ven = engineer_features(ven_clean, ppmc_ven, pppz_ven, pppp_ven)
-
-        arr.to_csv("arr_mede_final.csv", index=False)
-        ven.to_csv("ven_mede_final.csv", index=False)
+        # Row-level features only; price-derived barrio features come after the split
+        arr = engineer_features(arr_clean)
+        ven = engineer_features(ven_clean)
         print(f"  arr: {len(arr)} rows | ven: {len(ven)} rows")
 
         mlflow.log_params({
@@ -931,38 +1024,17 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
         # Preprocess ──────────────────────────────────────────────────────────
         print("\n[3/5] Preprocessing & feature selection...")
 
-        def prep(df):
-            y_full = np.log1p(df["precio"])
-            idx_tr, idx_te = train_test_split(
-                df.index, test_size=0.2, random_state=1954)
-            df_tr, df_te = df.loc[idx_tr].copy(), df.loc[idx_te].copy()
-            y_tr,  y_te = y_full.loc[idx_tr], y_full.loc[idx_te]
-
-            # Smoothed target encoding — computed on train split only
-            k = 10
-            global_mean = y_tr.mean()
-            stats = y_tr.groupby(df_tr["nombre"]).agg(["mean", "count"])
-            smooth = stats["count"] / (stats["count"] + k)
-            te_map = smooth * stats["mean"] + (1 - smooth) * global_mean
-            df_tr["barrio_te"] = df_tr["nombre"].map(
-                te_map).fillna(global_mean)
-            df_te["barrio_te"] = df_te["nombre"].map(
-                te_map).fillna(global_mean)
-
-            X_tr, X_te = df_tr[NUM_ATTRIBS +
-                               CAT_ATTRIBS], df_te[NUM_ATTRIBS + CAT_ATTRIBS]
-            pp = make_preprocessor()
-            X_tr_t = pd.DataFrame(pp.fit_transform(
-                X_tr), columns=pp.get_feature_names_out())
-            X_te_t = pd.DataFrame(pp.transform(
-                X_te),     columns=pp.get_feature_names_out())
-            cols = select_features(X_tr_t, y_tr, max_features=22)
-            return pp, X_tr_t[cols], X_te_t[cols], y_tr, y_te, cols, te_map
-
-        pp_arr, X_tr_arr, X_te_arr, y_tr_arr, y_te_arr, cols_arr, te_arr = prep(
+        pp_arr, X_tr_arr, X_te_arr, y_tr_arr, y_te_arr, cols_arr, stats_arr = prep(
             arr)
-        pp_ven, X_tr_ven, X_te_ven, y_tr_ven, y_te_ven, cols_ven, te_ven = prep(
+        pp_ven, X_tr_ven, X_te_ven, y_tr_ven, y_te_ven, cols_ven, stats_ven = prep(
             ven)
+
+        # Artifacts the app needs: statistics learned from TRAIN rows only
+        te_arr, te_ven = stats_arr["te"], stats_ven["te"]
+        ppmc_arr, pppz_arr, pppp_arr = (stats_arr["ppmc"], stats_arr["pppz"],
+                                        stats_arr["pppp"])
+        ppmc_ven, pppz_ven, pppp_ven = (stats_ven["ppmc"], stats_ven["pppz"],
+                                        stats_ven["pppp"])
 
         # Optuna tuning ───────────────────────────────────────────────────────
         print("\n[4/5] Hyperparameter tuning (Optuna)...")
@@ -997,6 +1069,12 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
             metrics["ven"] = evaluate(
                 stack_ven, X_te_ven, y_te_ven, "Venta Ensemble")
 
+        # Out-of-sample prediction for every listing -> CSVs used by the app ──
+        arr = attach_predictions(arr, stack_arr, y_tr_arr, y_te_arr, X_te_arr)
+        ven = attach_predictions(ven, stack_ven, y_tr_ven, y_te_ven, X_te_ven)
+        arr.to_csv("arr_mede_final.csv", index=False)
+        ven.to_csv("ven_mede_final.csv", index=False)
+
         # MLflow ──────────────────────────────────────────────────────────────
         for split, m in metrics.items():
             mlflow.log_metrics({f"r2_{split}": m["r2"],
@@ -1027,6 +1105,7 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
         save(METRO_STATIONS, "metro_stations")
         save({"arr": metrics.get("arr", {}).get("r2", 0),
               "ven": metrics.get("ven", {}).get("r2", 0)}, "model_r2")
+        save(metrics, "model_metrics")
 
         mlflow.log_artifacts(str(ARTIFACTS_DIR))
         print("\n✓ Done.  Run: mlflow ui   to inspect results.")
