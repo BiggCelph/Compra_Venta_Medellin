@@ -1,0 +1,17 @@
+# Used ONLY by the GitHub Action that runs train.py.
+# IMPORTANT: pin scikit-learn, xgboost, lightgbm, pandas and numpy to EXACTLY the same versions
+# as your app's requirements.txt (e.g. scikit-learn==1.5.2). The models are pickled here and loaded
+# in the Streamlit app; different versions can fail to load or silently change predictions.
+pandas
+numpy
+scikit-learn
+xgboost
+lightgbm
+optuna
+mlflow
+geopandas
+pyogrio
+shapely
+pyproj
+geopy
+requests
