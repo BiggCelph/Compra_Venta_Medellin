@@ -134,6 +134,28 @@ TR = {
                        "Explica el precio del modelo, no por qué el anuncio está barato.",
         "median_error": "Error mediano",
         "model_error": "Error mediano del modelo: {pct:.1f}%",
+        "nav_hist": "📈 Histórico",
+        "hist_title": "Histórico de precios y del modelo",
+        "hist_intro": "Evolución semanal del precio mediano por m² de cada barrio y de las métricas del modelo.",
+        "hist_note": "Son precios de oferta (anuncios), no de cierre. La mezcla de anuncios cambia cada semana, así que en barrios con pocos anuncios la serie es ruidosa.",
+        "hist_tab_barrio": "Por barrio",
+        "hist_tab_model": "Métricas del modelo",
+        "hist_none": "Aún no hay histórico. Corre snapshot.py (semanal) o train.py para empezar a guardarlo.",
+        "hist_one_week": "Solo hay una semana guardada; la línea aparecerá cuando haya más.",
+        "hist_band": "Rango P25–P75",
+        "hist_median": "Mediana",
+        "hist_listings": "{n} anuncios esta semana",
+        "hist_metric": "Métrica",
+        "m_r2": "R² (test)",
+        "m_oof_r2": "R² (validación cruzada)",
+        "m_mape": "Error mediano (%)",
+        "m_mae": "MAE (COP)",
+        "m_coverage80": "Cobertura del rango 80% (%)",
+        "mh_r2": "Qué tan bien explica el modelo los precios de anuncios que nunca vio (set de test).",
+        "mh_oof_r2": "R² con validación cruzada sobre entrenamiento. Si se aleja mucho del R² de test, hay sobreajuste o fuga de datos.",
+        "mh_mape": "Error porcentual mediano en el set de test. Menor es mejor.",
+        "mh_mae": "Error absoluto medio en pesos, en el set de test. Menor es mejor.",
+        "mh_coverage80": "% de anuncios de test dentro del rango q10–q90. Lo ideal es cerca de 80%.",
     },
     "en": {
         "nav_opp": "🎯 Opportunities",
@@ -226,6 +248,28 @@ TR = {
                        "It explains the model price, not why the listing is cheap.",
         "median_error": "Median error",
         "model_error": "Model median error: {pct:.1f}%",
+        "nav_hist": "📈 History",
+        "hist_title": "Price and model history",
+        "hist_intro": "Weekly median price per m² for each neighbourhood, and the model's metrics over time.",
+        "hist_note": "These are asking prices (listings), not closing prices. The mix of listings changes every week, so series for neighbourhoods with few listings are noisy.",
+        "hist_tab_barrio": "By neighbourhood",
+        "hist_tab_model": "Model metrics",
+        "hist_none": "No history yet. Run snapshot.py (weekly) or train.py to start saving it.",
+        "hist_one_week": "Only one week saved so far; the line will appear once there are more.",
+        "hist_band": "P25–P75 range",
+        "hist_median": "Median",
+        "hist_listings": "{n} listings this week",
+        "hist_metric": "Metric",
+        "m_r2": "R² (test)",
+        "m_oof_r2": "R² (cross-validation)",
+        "m_mape": "Median error (%)",
+        "m_mae": "MAE (COP)",
+        "m_coverage80": "80% range coverage (%)",
+        "mh_r2": "How well the model explains prices of listings it never saw (test set).",
+        "mh_oof_r2": "Cross-validated R² on training data. If it drifts far from test R², there is overfitting or leakage.",
+        "mh_mape": "Median percentage error on the test set. Lower is better.",
+        "mh_mae": "Mean absolute error in pesos on the test set. Lower is better.",
+        "mh_coverage80": "% of test listings inside the q10–q90 range. Ideal is close to 80%.",
     },
 }
 
@@ -408,6 +452,18 @@ def _to_frame(X, pp) -> pd.DataFrame:
     if hasattr(X, "toarray"):
         X = X.toarray()
     return pd.DataFrame(X, columns=pp.get_feature_names_out())
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_history() -> dict:
+    """Weekly history CSVs written by history.py (None if not there yet)."""
+    out = {}
+    for key, fname in [("prices", "history_prices.csv"),
+                       ("metrics", "history_metrics.csv")]:
+        p = Path(_artifact(fname))
+        out[key] = (pd.read_csv(p, parse_dates=["week"])
+                    if p.exists() else None)
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -690,7 +746,7 @@ TIPOS = sorted(set(T["arr"]["tipo"].dropna().unique())
                | set(T["ven"]["tipo"].dropna().unique()))
 
 with st.sidebar:
-    section = st.radio("nav", ["opp", "price", "pred"],
+    section = st.radio("nav", ["opp", "price", "pred", "hist"],
                        format_func=lambda k: t(f"nav_{k}"),
                        label_visibility="collapsed", key="section")
     st.divider()
@@ -1015,6 +1071,127 @@ def page_predictor():
 # ─────────────────────────────────────────────────────────────────────────────
 # Router
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 4 — History (weekly price per m² by barrio + model metrics)
+# ─────────────────────────────────────────────────────────────────────────────
+HIST_CITY = "Medellín (total)"      # must match history.CITY
+_TEAL = "#0d9488"
+
+
+def _hist_price_fig(d: pd.DataFrame, ytitle: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d["week"], y=d["p75_ppm2"], mode="lines", line=dict(width=0),
+        hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(
+        x=d["week"], y=d["p25_ppm2"], mode="lines", line=dict(width=0),
+        fill="tonexty", fillcolor="rgba(13,148,136,0.18)",
+        hoverinfo="skip", name=t("hist_band")))
+    fig.add_trace(go.Scatter(
+        x=d["week"], y=d["median_ppm2"], mode="lines+markers",
+        line=dict(color=_TEAL, width=2.5), marker=dict(size=7),
+        customdata=d["n"], name=t("hist_median"),
+        hovertemplate="%{x|%d %b %Y}<br>$%{y:,.0f}<br>n=%{customdata}<extra></extra>"))
+    fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0),
+                      yaxis_title=ytitle,
+                      legend=dict(orientation="h", y=1.12))
+    return fig
+
+
+def _hist_metric_fig(d: pd.DataFrame, metric: str) -> go.Figure:
+    y = d[metric] * 100 if metric == "coverage80" else d[metric]
+    fmt = {"r2": ".3f", "oof_r2": ".3f", "mape": ".1f",
+           "mae": ",.0f", "coverage80": ".1f"}[metric]
+    fig = go.Figure(go.Scatter(
+        x=d["week"], y=y, mode="lines+markers",
+        line=dict(color=_TEAL, width=2.5), marker=dict(size=7),
+        hovertemplate=f"%{{x|%d %b %Y}}<br>%{{y:{fmt}}}<extra></extra>"))
+    if metric == "coverage80":
+        fig.add_hline(y=80, line_dash="dot", line_color="#94a3b8",
+                      annotation_text="80%")
+    fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0),
+                      showlegend=False)
+    return fig
+
+
+def _hist_prices_tab(P):
+    if P is None or P.empty:
+        st.info(t("hist_none"))
+        return
+    others = sorted(b for b in P["barrio"].dropna().unique() if b != HIST_CITY)
+    options = ([HIST_CITY] if (P["barrio"] ==
+               HIST_CITY).any() else []) + others
+    c1, c2 = st.columns([3, 1])
+    barrio = c1.selectbox(t("barrio"), options, key="hist_barrio")
+    tipo = c2.selectbox(t("tipo"), ["all"] + TIPOS,
+                        format_func=lambda x: t(
+                            "all") if x == "all" else tipo_label(x),
+                        key="hist_tipo")
+    if P["week"].nunique() < 2:
+        st.caption("ℹ️ " + t("hist_one_week"))
+
+    for col, kind in zip(st.columns(2, gap="large"), KINDS):
+        d = P[(P["kind"] == kind) & (P["barrio"] == barrio)
+              & (P["tipo"] == tipo)].sort_values("week")
+        with col.container(border=True):
+            st.caption(f"{t(f'kind_{kind}')} — {t(f'per_m2_{kind}')}")
+            if d.empty:
+                st.caption(t("no_data"))
+                continue
+            last = d.iloc[-1]
+            delta = None
+            if len(d) > 1 and d.iloc[-2]["median_ppm2"] > 0:
+                delta = f"{(last['median_ppm2'] / d.iloc[-2]['median_ppm2'] - 1) * 100:+.1f}%"
+            st.metric(t(f"kind_{kind}"), fmt_full(last["median_ppm2"]),
+                      delta=delta, delta_color="off")
+            st.caption(t("hist_listings", n=int(last["n"])))
+            if last["n"] < 5:
+                st.caption("⚠️ " + t("few"))
+            st.plotly_chart(_hist_price_fig(d, t(f"per_m2_{kind}")),
+                            use_container_width=True)
+
+
+def _hist_metrics_tab(M):
+    if M is None or M.empty:
+        st.info(t("hist_none"))
+        return
+    metric = st.selectbox(t("hist_metric"),
+                          ["r2", "oof_r2", "mape", "mae", "coverage80"],
+                          format_func=lambda k: t(f"m_{k}"), key="hist_metric")
+    st.caption(t(f"mh_{metric}"))
+    if M["week"].nunique() < 2:
+        st.caption("ℹ️ " + t("hist_one_week"))
+
+    for col, kind in zip(st.columns(2, gap="large"), KINDS):
+        d = M[M["kind"] == kind].sort_values("week")
+        with col.container(border=True):
+            st.caption(f"{t(f'kind_{kind}')} — {t(f'm_{metric}')}")
+            if d.empty or d[metric].isna().all():
+                st.caption(t("no_data"))
+                continue
+            d = d.dropna(subset=[metric])
+            v = d[metric].iloc[-1]
+            shown = (f"{v * 100:.1f}%" if metric == "coverage80"
+                     else f"{v:,.0f}" if metric == "mae"
+                     else f"{v:.1f}%" if metric == "mape" else f"{v:.3f}")
+            st.metric(t(f"m_{metric}"), shown)
+            st.plotly_chart(_hist_metric_fig(d, metric),
+                            use_container_width=True)
+
+
+def page_history():
+    st.header(t("hist_title"))
+    st.caption(t("hist_intro"))
+    with st.container(border=True):
+        st.caption("ℹ️ " + t("hist_note"))
+    H = load_history()
+    tab_b, tab_m = st.tabs([t("hist_tab_barrio"), t("hist_tab_model")])
+    with tab_b:
+        _hist_prices_tab(H["prices"])
+    with tab_m:
+        _hist_metrics_tab(H["metrics"])
+
+
 def kpi_strip():
     st.markdown(f"### 🏙️ {t('app_title')}")
     st.caption(t("app_tagline"))
@@ -1031,5 +1208,5 @@ def kpi_strip():
 kpi_strip()
 {"opp": page_opportunities,
  "price": page_price_check,
- "pred": page_predictor}[section]()
-   
+ "pred": page_predictor,
+ "hist": page_history}[section]()

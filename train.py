@@ -28,7 +28,8 @@ Outputs  →  ./artifacts/
     metro_stations.pkl
     list_barrios.pkl
     model_r2.pkl
-    model_metrics.pkl     (r2 / mae / median APE on the held-out test set)
+    model_metrics.pkl     (r2 / oof_r2 / mae / median APE / interval coverage)
+    history_prices.csv / history_metrics.csv   (weekly history, appended)
     arr_mede_final.csv   / ven_mede_final.csv
 """
 
@@ -48,6 +49,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import requests
+import history
 from geopy.distance import geodesic
 from lightgbm import LGBMRegressor
 from sklearn.compose import ColumnTransformer
@@ -101,7 +103,6 @@ METRO_STATIONS = [
     ("La Mota",         6.251667, -75.621389),
     ("San Javier",      6.256991, -75.611983),
     # ── Cable K (Acevedo → Santo Domingo) ────────────────────────────────────
-    ("Aranjuez",        6.299855, -75.558723),
     ("Andalucía",       6.296078, -75.551899),
     ("Villa Sierra",    6.302222, -75.538889),
     ("Santo Domingo",   6.293074, -75.541733),
@@ -359,10 +360,14 @@ def validate_barrio_assignment(df: pd.DataFrame, geo: gpd.GeoDataFrame,
     # Get barrio centroids
     geo_copy = geo.copy()
     geo_copy.columns = geo_copy.columns.str.lower()
-    geo_copy["centroid"] = geo_copy.geometry.centroid
+    # Centroids in a projected CRS (meters, Colombia MAGNA-SIRGAS / Bogotá),
+    # then back to lat/lon so .x/.y are comparable with property lat/lon.
+    geo_copy["centroid"] = (geo_copy.to_crs("EPSG:3116").geometry.centroid
+                            .set_crs("EPSG:3116").to_crs("EPSG:4326"))
     centroids = geo_copy[["nombre", "centroid"]].copy()
     centroids["nombre"] = centroids["nombre"].apply(clean_nombre)
     centroid_map = dict(zip(centroids["nombre"], centroids["centroid"]))
+    norm_to_name = {_norm(bn): bn for bn in centroid_map}
 
     fixed = 0
     for idx, row in df.iterrows():
@@ -380,12 +385,10 @@ def validate_barrio_assignment(df: pd.DataFrame, geo: gpd.GeoDataFrame,
         # trust the URL instead
         if dist > max_distance_km and pd.notna(row["_url_loc"]):
             # Normalize the URL location to match shapefile casing if possible
-            url_loc_norm = row["_url_loc"]
-            for bn in centroid_map.keys():
-                if bn.lower() == url_loc_norm.lower():
-                    df.at[idx, "nombre"] = bn
-                    fixed += 1
-                    break
+            bn = norm_to_name.get(_norm(row["_url_loc"]))
+            if bn is not None:
+                df.at[idx, "nombre"] = bn
+                fixed += 1
 
     df = df.drop(columns=["_url_loc"])
     if fixed > 0:
@@ -600,14 +603,29 @@ def add_metro_distance(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def price_aggregates(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Per-barrio price per m², per space and per parking, from the rows given."""
-    pt = df.groupby("nombre")["precio"].sum().astype(float)
-    at = df.groupby("nombre")["area"].sum().replace(0, np.nan).astype(float)
-    esp = df.groupby("nombre")["espacios"].sum().replace(
-        0, np.nan).astype(float)
-    pq = (df.groupby("nombre")["parqueaderos"].sum() + 1).astype(float)
-    return (pt / at).dropna(), (pt / esp).dropna(), (pt / pq).dropna()
+def price_aggregates(df: pd.DataFrame, k: int = 5
+                     ) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Per-barrio price per m², per space and per parking, from the rows given.
+    Shrunk toward the global ratio: a barrio with n listings gets weight
+    n/(n+k) on its own ratio, so tiny barrios don't produce noisy values.
+    """
+    g = df.groupby("nombre")
+    n = g["precio"].count().astype(float)
+    pt = g["precio"].sum().astype(float)
+    at = g["area"].sum().replace(0, np.nan).astype(float)
+    esp = g["espacios"].sum().replace(0, np.nan).astype(float)
+    pq = (g["parqueaderos"].sum() + 1).astype(float)
+
+    def shrink(num, den, glob):
+        raw = (num / den).dropna()
+        w = n.reindex(raw.index) / (n.reindex(raw.index) + k)
+        return w * raw + (1 - w) * glob
+
+    P = float(pt.sum())
+    return (shrink(pt, at, P / float(at.sum())),
+            shrink(pt, esp, P / float(esp.sum())),
+            shrink(pt, pq, P / float(pq.sum())))
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -700,7 +718,7 @@ def prep(df: pd.DataFrame):
                           columns=pp.get_feature_names_out())
     X_te_t = pd.DataFrame(pp.transform(X_te),
                           columns=pp.get_feature_names_out())
-    cols = select_features(X_tr_t, y_tr, max_features=22)
+    cols = select_features(X_tr_t, y_tr, max_features=16)
     return pp, X_tr_t[cols], X_te_t[cols], y_tr, y_te, cols, stats
 
 
@@ -721,13 +739,18 @@ def make_preprocessor() -> ColumnTransformer:
 # 5. FEATURE SELECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def select_features(X: pd.DataFrame, y: pd.Series, max_features: int = 22) -> list[str]:
+def _cv() -> KFold:
+    """Shuffled folds so CSV (scrape) order can't bias CV."""
+    return KFold(n_splits=5, shuffle=True, random_state=42)
+
+
+def select_features(X: pd.DataFrame, y: pd.Series, max_features: int = 16) -> list[str]:
     probe = XGBRegressor(n_estimators=300, max_depth=4, learning_rate=0.1,
                          subsample=0.8, random_state=42, verbosity=0)
     probe.fit(X, y)
     top = pd.Series(probe.feature_importances_, index=X.columns).nlargest(
         max_features).index.tolist()
-    cv_r2 = cross_val_score(probe, X[top], y, cv=5, scoring="r2").mean()
+    cv_r2 = cross_val_score(probe, X[top], y, cv=_cv(), scoring="r2").mean()
     print(f"  Feature selection: {len(top)} features | CV R²: {cv_r2:.4f}")
     print(f"  {top}")
     return top
@@ -753,7 +776,7 @@ def _xgb_obj(trial, X, y):
     )
     try:
         scores = cross_val_score(XGBRegressor(**p), _safe_X(X), y,
-                                 cv=5, scoring="r2", error_score="raise")
+                                 cv=_cv(), scoring="r2", error_score="raise")
         result = float(np.nan_to_num(scores, nan=-1.0).mean())
         return result if np.isfinite(result) else -1.0
     except Exception:
@@ -776,7 +799,7 @@ def _lgb_obj(trial, X, y):
     )
     try:
         scores = cross_val_score(LGBMRegressor(**p), _safe_X(X), y,
-                                 cv=5, scoring="r2", error_score="raise")
+                                 cv=_cv(), scoring="r2", error_score="raise")
         result = float(np.nan_to_num(scores, nan=-1.0).mean())
         return result if np.isfinite(result) else -1.0
     except Exception:
@@ -870,7 +893,7 @@ class StackedEnsemble:
 
 def train_quantile_models(X_tr, y_tr, X_te, y_te, label) -> tuple:
     print(f"  Quantile models ({label})...")
-    models = {}
+    models, preds = {}, {}
     for q, name in [(0.10, "q10"), (0.90, "q90")]:
         m = XGBRegressor(
             objective="reg:quantileerror", quantile_alpha=q,
@@ -879,13 +902,16 @@ def train_quantile_models(X_tr, y_tr, X_te, y_te, label) -> tuple:
             random_state=42, n_jobs=-1, verbosity=0,
         )
         m.fit(X_tr, y_tr)
-        pred = np.expm1(m.predict(X_te))
-        actual = np.expm1(y_te)
-        coverage = (pred <= actual).mean() if q == 0.90 else (
-            pred >= actual).mean()
-        print(f"    {name}: coverage={coverage:.1%}")
+        preds[name] = np.expm1(m.predict(X_te))
         models[name] = m
-    return models["q10"], models["q90"]
+    actual = np.expm1(y_te).values
+    lo = np.minimum(preds["q10"], preds["q90"])
+    hi = np.maximum(preds["q10"], preds["q90"])
+    print(f"    below q10: {(actual < preds['q10']).mean():.1%} (target 10%) | "
+          f"above q90: {(actual > preds['q90']).mean():.1%} (target 10%)")
+    cov = float(((actual >= lo) & (actual <= hi)).mean())
+    print(f"    80% interval coverage on test: {cov:.1%} (target 80%)")
+    return models["q10"], models["q90"], cov
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -954,7 +980,24 @@ def save(obj, name: str):
 # 11. FULL PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = False):
+def build_url_map(arr_raw: pd.DataFrame, ven_raw: pd.DataFrame,
+                  geo: gpd.GeoDataFrame) -> dict[str, str]:
+    """url_loc → nombre map from arriendo + venta raw data together."""
+    raw = pd.concat([arr_raw, ven_raw], ignore_index=True).dropna(
+        subset=["latitud", "longitud"])
+    gdf = gpd.GeoDataFrame(
+        raw, geometry=gpd.points_from_xy(raw["longitud"], raw["latitud"]),
+        crs="EPSG:4326")
+    joined = gdf.sjoin(geo.to_crs("EPSG:4326"), how="left")
+    joined = joined[~joined.index.duplicated(keep="first")]
+    joined.columns = joined.columns.str.lower()
+    joined["nombre"] = joined["nombre"].astype(str).apply(clean_nombre)
+    joined = joined[~joined["nombre"].str.lower().isin(["nan", "none", ""])]
+    return build_url_loc_nombre_map(pd.DataFrame(joined))
+
+
+def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = False,
+                 snapshot_prices: bool = False):
     n_trials = 20 if fast else 50
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
@@ -978,26 +1021,7 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
 
         # Build url_loc → nombre map from the combined raw scrape so both
         # arriendo and venta benefit from each other's signal
-        print("  Building url_loc→nombre map from raw data...")
-        _raw_combined = pd.concat([arr_raw, ven_raw], ignore_index=True)
-        # Do a lightweight sjoin on the combined raw data to get initial nombres
-        _gdf = gpd.GeoDataFrame(
-            _raw_combined.dropna(subset=["latitud", "longitud"]),
-            geometry=gpd.points_from_xy(
-                _raw_combined.dropna(subset=["latitud", "longitud"])[
-                    "longitud"],
-                _raw_combined.dropna(subset=["latitud", "longitud"])[
-                    "latitud"],
-            ),
-            crs="EPSG:4326",
-        )
-        _joined = _gdf.sjoin(geo.to_crs("EPSG:4326"), how="left")
-        _joined = _joined[~_joined.index.duplicated(keep="first")]
-        _joined.columns = _joined.columns.str.lower()
-        _joined["nombre"] = _joined["nombre"].astype(str).apply(clean_nombre)
-        _joined = _joined[~_joined["nombre"].str.lower().isin(
-            ["nan", "none", ""])]
-        url_loc_map = build_url_loc_nombre_map(pd.DataFrame(_joined))
+        url_loc_map = build_url_map(arr_raw, ven_raw, geo)
 
         arr_clean = clean(arr_raw, geo, "arriendo", url_loc_map)
         ven_clean = clean(ven_raw, geo, "venta",    url_loc_map)
@@ -1019,7 +1043,7 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
             "n_trials": n_trials,
         })
 
-        list_barrios = sorted(arr["nombre"].unique().tolist())
+        list_barrios = sorted(set(arr["nombre"]) | set(ven["nombre"]))
 
         # Preprocess ──────────────────────────────────────────────────────────
         print("\n[3/5] Preprocessing & feature selection...")
@@ -1055,60 +1079,91 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
             stack_arr = StackedEnsemble(
                 best_arr["xgb"], best_arr["lgb"]
             ).fit(X_tr_arr, y_tr_arr)
-            q10_arr, q90_arr = train_quantile_models(
+            q10_arr, q90_arr, cov_arr = train_quantile_models(
                 X_tr_arr, y_tr_arr, X_te_arr, y_te_arr, "Arriendo")
             metrics["arr"] = evaluate(
                 stack_arr, X_te_arr, y_te_arr, "Arriendo Ensemble")
+            metrics["arr"].update(
+                oof_r2=float(r2_score(y_tr_arr, stack_arr.oof_pred_)),
+                coverage80=cov_arr, n_rows=len(arr))
 
         if mode in ("both", "venta"):
             stack_ven = StackedEnsemble(
                 best_ven["xgb"], best_ven["lgb"]
             ).fit(X_tr_ven, y_tr_ven)
-            q10_ven, q90_ven = train_quantile_models(
+            q10_ven, q90_ven, cov_ven = train_quantile_models(
                 X_tr_ven, y_tr_ven, X_te_ven, y_te_ven, "Venta")
             metrics["ven"] = evaluate(
                 stack_ven, X_te_ven, y_te_ven, "Venta Ensemble")
+            metrics["ven"].update(
+                oof_r2=float(r2_score(y_tr_ven, stack_ven.oof_pred_)),
+                coverage80=cov_ven, n_rows=len(ven))
 
         # Out-of-sample prediction for every listing -> CSVs used by the app ──
         arr = attach_predictions(arr, stack_arr, y_tr_arr, y_te_arr, X_te_arr)
         ven = attach_predictions(ven, stack_ven, y_tr_ven, y_te_ven, X_te_ven)
 
-        arr.to_csv(ARTIFACTS_DIR / "arr_mede_final.csv", index=False)
-        ven.to_csv(ARTIFACTS_DIR / "ven_mede_final.csv", index=False)
-        print(f"  Saved → {ARTIFACTS_DIR / 'arr_mede_final.csv'}")
-        print(f"  Saved → {ARTIFACTS_DIR / 'ven_mede_final.csv'}")
+        # Only write what this run actually trained (never overwrite the
+        # other mode's good files with NaN predictions / None models)
+        if stack_arr is not None:
+            arr.to_csv(ARTIFACTS_DIR / "arr_mede_final.csv", index=False)
+            print(f"  Saved → {ARTIFACTS_DIR / 'arr_mede_final.csv'}")
+        if stack_ven is not None:
+            ven.to_csv(ARTIFACTS_DIR / "ven_mede_final.csv", index=False)
+            print(f"  Saved → {ARTIFACTS_DIR / 'ven_mede_final.csv'}")
+
+        # Weekly history ──────────────────────────────────────────────────────
+        history.log_metrics(metrics)
+        if not skip_scrape or snapshot_prices:
+            history.snapshot_prices({"arr": arr, "ven": ven})
+        else:
+            print("  Price history not updated (--skip-scrape reuses old data). "
+                  "Use snapshot.py, or --snapshot-prices to force.")
 
         # MLflow ──────────────────────────────────────────────────────────────
         for split, m in metrics.items():
             mlflow.log_metrics({f"r2_{split}": m["r2"],
                                 f"mae_{split}": m["mae"],
-                                f"mape_{split}": m["mape"]})
+                                f"mape_{split}": m["mape"],
+                                f"oof_r2_{split}": m["oof_r2"],
+                                f"coverage80_{split}": m["coverage80"]})
 
         # Save ────────────────────────────────────────────────────────────────
         print("\nSaving artifacts...")
-        save(pp_arr,       "preprocessor_arr")
-        save(pp_ven,       "preprocessor_ven")
-        save(cols_arr,     "best_features_arr")
-        save(cols_ven,     "best_features_ven")
-        save(te_arr,       "barrio_te_arr")
-        save(te_ven,       "barrio_te_ven")
-        save(stack_arr,    "stack_arr")
-        save(stack_ven,    "stack_ven")
-        save(q10_arr,      "q10_arr")
-        save(q90_arr,      "q90_arr")
-        save(q10_ven,      "q10_ven")
-        save(q90_ven,      "q90_ven")
-        save(ppmc_arr,     "price_per_m2_arr")
-        save(ppmc_ven,     "price_per_m2_ven")
-        save(pppz_arr,     "price_per_space_arr")
-        save(pppz_ven,     "price_per_space_ven")
-        save(pppp_arr,     "price_per_parking_arr")
-        save(pppp_ven,     "price_per_parking_ven")
-        save(list_barrios, "list_barrios")
-        save(METRO_STATIONS, "metro_stations")
-        save({"arr": metrics.get("arr", {}).get("r2", 0),
-              "ven": metrics.get("ven", {}).get("r2", 0)}, "model_r2")
-        save(metrics, "model_metrics")
+        do_arr, do_ven = stack_arr is not None, stack_ven is not None
+        shared = [(list_barrios, "list_barrios"),
+                  (METRO_STATIONS, "metro_stations")]
+        per_kind = {
+            "arr": [(pp_arr, "preprocessor_arr"), (cols_arr, "best_features_arr"),
+                    (te_arr, "barrio_te_arr"), (stack_arr, "stack_arr"),
+                    (q10_arr, "q10_arr"), (q90_arr, "q90_arr"),
+                    (ppmc_arr, "price_per_m2_arr"),
+                    (pppz_arr, "price_per_space_arr"),
+                    (pppp_arr, "price_per_parking_arr")],
+            "ven": [(pp_ven, "preprocessor_ven"), (cols_ven, "best_features_ven"),
+                    (te_ven, "barrio_te_ven"), (stack_ven, "stack_ven"),
+                    (q10_ven, "q10_ven"), (q90_ven, "q90_ven"),
+                    (ppmc_ven, "price_per_m2_ven"),
+                    (pppz_ven, "price_per_space_ven"),
+                    (pppp_ven, "price_per_parking_ven")],
+        }
+        for obj, name in shared:
+            save(obj, name)
+        for kind, ok in (("arr", do_arr), ("ven", do_ven)):
+            if ok:
+                for obj, name in per_kind[kind]:
+                    save(obj, name)
+
+        # Merge metrics with any existing file so a single-mode run keeps
+        # the other mode's numbers
+        def _merge(fname: str, new: dict) -> dict:
+            p = ARTIFACTS_DIR / f"{fname}.pkl"
+            old = pickle.load(open(p, "rb")) if p.exists() else {}
+            return {**old, **new}
+
+        save(_merge("model_r2", {k: v["r2"] for k, v in metrics.items()}),
+             "model_r2")
+        save(_merge("model_metrics", metrics), "model_metrics")
 
         mlflow.log_artifacts(str(ARTIFACTS_DIR))
         print("\n✓ Done.  Run: mlflow ui   to inspect results.")
@@ -1122,5 +1177,8 @@ if __name__ == "__main__":
                    "arriendo", "venta"], default="both")
     p.add_argument("--fast", action="store_true",
                    help="20 Optuna trials (dev mode)")
+    p.add_argument("--snapshot-prices", action="store_true",
+                   help="store a price snapshot even with --skip-scrape")
     a = p.parse_args()
-    run_pipeline(skip_scrape=a.skip_scrape, mode=a.mode, fast=a.fast)
+    run_pipeline(skip_scrape=a.skip_scrape, mode=a.mode, fast=a.fast,
+                 snapshot_prices=a.snapshot_prices)
