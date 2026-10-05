@@ -1072,8 +1072,11 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
         # Out-of-sample prediction for every listing -> CSVs used by the app ──
         arr = attach_predictions(arr, stack_arr, y_tr_arr, y_te_arr, X_te_arr)
         ven = attach_predictions(ven, stack_ven, y_tr_ven, y_te_ven, X_te_ven)
-        arr.to_csv("arr_mede_final.csv", index=False)
-        ven.to_csv("ven_mede_final.csv", index=False)
+
+        arr.to_csv(ARTIFACTS_DIR / "arr_mede_final.csv", index=False)
+        ven.to_csv(ARTIFACTS_DIR / "ven_mede_final.csv", index=False)
+        print(f"  Saved → {ARTIFACTS_DIR / 'arr_mede_final.csv'}")
+        print(f"  Saved → {ARTIFACTS_DIR / 'ven_mede_final.csv'}")
 
         # MLflow ──────────────────────────────────────────────────────────────
         for split, m in metrics.items():

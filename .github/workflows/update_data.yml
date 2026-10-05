@@ -1,0 +1,62 @@
+name: Refresh listings and retrain
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"          # Mondays 08:00 UTC = 03:00 in Medellín
+  workflow_dispatch:             # manual run from the Actions tab
+    inputs:
+      fast:
+        description: "Fast mode (20 Optuna trials instead of 50) - good for the first test"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                # lets the job push the refreshed files
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"             # use the same version as your Streamlit Cloud app
+          cache: pip
+          cache-dependency-path: requirements-train.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-train.txt
+
+      - name: Keep a copy of the current artifacts (for the quality gate)
+        run: cp -r artifacts artifacts_prev
+
+      - name: Scrape, clean and train
+        env:
+          MC_API_KEY: ${{ secrets.MC_API_KEY }}
+        run: python train.py ${{ inputs.fast && '--fast' || '' }}
+
+      - name: Quality gate
+        run: python ci_check.py
+
+      - name: Commit refreshed data and models
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add artifacts
+          if git diff --cached --quiet; then
+            echo "Nothing changed - nothing to commit."
+          else
+            git commit -m "Auto-refresh listings and models ($(date -u +%F))"
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi

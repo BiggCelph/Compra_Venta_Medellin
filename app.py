@@ -1032,3 +1032,4 @@ kpi_strip()
 {"opp": page_opportunities,
  "price": page_price_check,
  "pred": page_predictor}[section]()
+   
