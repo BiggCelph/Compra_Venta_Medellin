@@ -95,7 +95,7 @@ metrocuadrado.com
 ### Install
 
 ```bash
-git clone https://github.com/roman-correa/Compra_Venta_Medellin.git
+git clone https://github.com/BiggCelph/Compra_Venta_Medellin.git
 cd Compra_Venta_Medellin
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
