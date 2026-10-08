@@ -95,7 +95,7 @@ metrocuadrado.com
 ### Install
 
 ```bash
-git clone https://github.com/roman-correa/Compra_Venta_Medellin.git
+git clone https://github.com/BiggCelph/Compra_Venta_Medellin.git
 cd Compra_Venta_Medellin
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
@@ -183,4 +183,4 @@ Listings scraped from [metrocuadrado.com](https://www.metrocuadrado.com) — Col
 ## Author
 
 **Roman Alejandro Correa**  
-[GitHub](https://github.com/roman-correa)
+[GitHub](https://github.com/BiggCelph)
